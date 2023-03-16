@@ -1,12 +1,12 @@
 require "params.jinc"
 require "consts.jinc"
 require "shuffle.jinc"
-require "fips202.jinc"
+//require "fips202.jinc"
 require "fips202_avx2.jinc"
 require "fips202_4x.jinc"
 
 param int GENMATRIX_NBLOCKS = 3; // ((12*KYBER_N/8*4096/KYBER_Q + SHAKE128_RATE)/SHAKE128_RATE);
-param int REJ_BUFLEN = 512; // GENMATRIX_NBLOCKS * SHAKE128_RATE;
+param int REJ_BUFLEN = 512; // GENMATRIX_NBLOCKS * SHAKE128_RATE + 8;
 
 u8[2048] ru_idx = {-1, -1, -1, -1, -1, -1, -1, -1,
                 0, -1, -1, -1, -1, -1, -1, -1,
@@ -265,21 +265,6 @@ u8[2048] ru_idx = {-1, -1, -1, -1, -1, -1, -1, -1,
                 2,  4,  6,  8, 10, 12, 14, -1,
                 0,  2,  4,  6,  8, 10, 12, 14};
 
-/*
-inline
-fn __shake128_squeezenblocks(stack u64[25] state, stack u8[REJ_BUFLEN] out)
-      -> stack u64[25], stack u8[REJ_BUFLEN]
-{
-  inline int i;
-
-  for i = 0 to GENMATRIX_NBLOCKS 
-  {
-      state, out[i*SHAKE128_RATE:SHAKE128_RATE] = _shake128_squeezeblock(state, out[i*SHAKE128_RATE:SHAKE128_RATE]);
-  }
-  return state, out;
-}
-*/
-
 inline
 fn __rej_uniform(reg ptr u16[KYBER_N] rp, reg u64 offset, reg ptr u8[SHAKE128_RATE] buf, inline int buflen) ->  reg u64, stack u16[KYBER_N]
 {
@@ -381,8 +366,7 @@ fn __write_u128_boundchk( reg ptr u16[KYBER_N] rp
   return rp;
 }
 
-inline /* processes 2*24u8 (2*8*3u8) bytes
-        */ 
+inline
 fn __process2u192( reg ptr u16[KYBER_N] rp
 		 , reg u64 ctr
 		 , reg ptr u8[REJ_BUFLEN] buf	
@@ -487,8 +471,7 @@ fn __process2u192( reg ptr u16[KYBER_N] rp
   return rp, ctr, pos;
 }
 
-inline /* processes 1*24u8 (1*8*3u8) bytes
-       */ 
+inline
 fn __process1u192( reg ptr u16[KYBER_N] rp
 		 , reg u64 ctr
 		 , reg ptr u8[REJ_BUFLEN] buf	
@@ -555,9 +538,10 @@ fn __process1u192( reg ptr u16[KYBER_N] rp
   return rp, ctr, pos;
 }
 
-#[returnaddress="stack"]
-fn _rej_uniform_avx( reg ptr u16[KYBER_N] rp  // added some slack to allow 128bit stores for the last items
-                   , reg ptr u8[REJ_BUFLEN] buf // added some slack to allow 256bit read for the last 24byte chunk
+inline
+//#[returnaddress="stack"]
+fn __rej_uniform_avx( reg ptr u16[KYBER_N] rp 
+                   , reg ptr u8[REJ_BUFLEN] buf // added some slack to allow a 256bit read for the last 24byte chunk
                    ) -> reg u64
                       , reg ptr u16[KYBER_N]
 {
@@ -580,15 +564,11 @@ fn _rej_uniform_avx( reg ptr u16[KYBER_N] rp  // added some slack to allow 128bi
   mask = #VPBROADCAST_16u16(ru_mask_s);
   idx8 = ru_idx8_s[u256 0];
 
-  // First stage: process 2u192 (48 bytes) from buf, potentially producing 32 entries
+  // First stage: process 2u192 (48 bytes) from buf up to 10 times, potentially producing 32 entries peer iteration
     _, cf, _, _, zf = #CMP_64(ctr, KYBER_N - 1); // always true!
   fl1 = #SETcc(cf || zf);
   _, _, _, _, b = #TEST_8(fl1, fl1);
-  while (!b) { /* it performs at least 8 iterations (very, very unlikely! it would
-                 mean that less than 32 entries were rejected). It can also 
-		 perform 9 iterations, processing 432 bytes, but still with small
-                 prob. (0.03%). Most likelly, it performs 10 iterations (processing
-                 488 bytes), and filling the coef. array with prob. 74,76%. */
+  while (!b) { 
     rp, ctr, pos = __process2u192(rp, ctr, buf, pos, bound, ones, mask, idx8, idxp);
 
     _, cf, _, _, zf = #CMP_64(ctr, KYBER_N - 1);
@@ -606,12 +586,6 @@ fn _rej_uniform_avx( reg ptr u16[KYBER_N] rp  // added some slack to allow 128bi
   }
   // 10.5: pos = 504[336] -- Pr = 99.17%
 
-/*
-  if (ctr > 256) {
-    ctr = 256;
-  }
-*/
-
   return ctr, rp; // remark: ctr might be larger than 256
 }
 
@@ -620,11 +594,10 @@ fn _rej_uniform_avx( reg ptr u16[KYBER_N] rp  // added some slack to allow 128bi
 
 
 
-inline
-fn __gen_entry1x( reg ptr u16[KYBER_N] rp
-		, reg ptr u8[34] inbuf0
-//		, reg ptr u8[REJ_BUFLEN] buf0
-                ) -> reg ptr u16[KYBER_N] //, reg ptr u8[REJ_BUFLEN]
+fn _gen_entry1x( reg ptr u16[KYBER_N] rp
+		, reg ptr u8[32] seed
+		, reg u64 entry // obs: entry == entry & 0xFFFF
+                ) -> reg ptr u16[KYBER_N] 
 {
   stack u8[REJ_BUFLEN] buf;
   reg u256[7] st0;
@@ -632,11 +605,11 @@ fn __gen_entry1x( reg ptr u16[KYBER_N] rp
   reg u64 ctr0;
   stack u64 ctr0_s;
 
-  st0 = __shake128_absorb34_avx2(inbuf0);
+  st0 = __shake128_absorb_genmat_avx2(seed, entry);
   st0, buf = __shake128_squeeze3blocks_avx2(st0, buf);
 
   st0_s = st0;
-  ctr0, rp = _rej_uniform_avx(rp, buf);
+  ctr0, rp = __rej_uniform_avx(rp, buf);
   st0 = st0_s;
 
   while( ctr0 <= KYBER_N - 1 ) {
@@ -646,16 +619,14 @@ fn __gen_entry1x( reg ptr u16[KYBER_N] rp
     ctr0, rp = __rej_uniform(rp, ctr0, buf[0:SHAKE128_RATE], 1);
   }
 
-  return rp;//, buf0;
+  return rp;
 }
 
 
-//#[returnaddress="stack"]
-inline
 fn __gen_entry4x( reg ptr u16[4*KYBER_N] rp
-	       , reg ptr u8[34] inbuf0 inbuf1 inbuf2 inbuf3
-//	       , reg ptr u8[REJ_BUFLEN] buf0 buf1 buf2 buf3
-               ) -> reg ptr u16[4*KYBER_N] //, reg ptr u8[REJ_BUFLEN], reg ptr u8[REJ_BUFLEN], reg ptr u8[REJ_BUFLEN], reg ptr u8[REJ_BUFLEN]
+	       , reg ptr u8[32] seed
+	       , reg u64 e0 e1 e2 e3
+               ) -> reg ptr u16[4*KYBER_N]
 {
   // keccack state
   stack u256[25] state4x;
@@ -668,16 +639,16 @@ fn __gen_entry4x( reg ptr u16[4*KYBER_N] rp
   reg u8 flg0 flg1 flg2;
   reg bool cf zf;
 
-  state4x = __shake128_absorb4x_34(state4x, inbuf0, inbuf1, inbuf2, inbuf3);
+  state4x = __shake128_absorb4x_genmat(state4x, seed, e0, e1, e2, e3);
   state4x, buf0, buf1, buf2, buf3 = __shake128_squeeze3blocks_4x(state4x, buf0, buf1, buf2, buf3);
 
-  tmp, rp[0*KYBER_N:KYBER_N] = _rej_uniform_avx(rp[0*KYBER_N:KYBER_N], buf0);
+  tmp, rp[0*KYBER_N:KYBER_N] = __rej_uniform_avx(rp[0*KYBER_N:KYBER_N], buf0);
   ctr0 = tmp;
-  tmp, rp[1*KYBER_N:KYBER_N] = _rej_uniform_avx(rp[1*KYBER_N:KYBER_N], buf1);
+  tmp, rp[1*KYBER_N:KYBER_N] = __rej_uniform_avx(rp[1*KYBER_N:KYBER_N], buf1);
   ctr1 = tmp;
-  tmp, rp[2*KYBER_N:KYBER_N] = _rej_uniform_avx(rp[2*KYBER_N:KYBER_N], buf2);
+  tmp, rp[2*KYBER_N:KYBER_N] = __rej_uniform_avx(rp[2*KYBER_N:KYBER_N], buf2);
   ctr2 = tmp;
-  ctr3, rp[3*KYBER_N:KYBER_N] = _rej_uniform_avx(rp[3*KYBER_N:KYBER_N], buf3);
+  ctr3, rp[3*KYBER_N:KYBER_N] = __rej_uniform_avx(rp[3*KYBER_N:KYBER_N], buf3);
 
   _, cf, _, _, zf = #CMP_64(ctr0, KYBER_N - 1);
   flg0 = #SETcc(cf || zf); //SETBE
@@ -722,521 +693,80 @@ fn __gen_entry4x( reg ptr u16[4*KYBER_N] rp
     }
   }
 
-  return rp; //, buf0, buf1, buf2, buf3;
+  return rp;
 } 
 
+
+
+
 inline
-fn __gen_matrix_avx( //reg ptr u16[KYBER_K*KYBER_VECN] rr,
-                 reg ptr u8[KYBER_SYMBYTES] seed, 
-		 inline int transposed) -> stack u16[KYBER_K*KYBER_VECN]
+fn __gen_matrix(stack u8[KYBER_SYMBYTES] seed, inline int transposed) -> stack u16[KYBER_K*KYBER_VECN]
 {
-  stack u8[34] inbuf0 inbuf1 inbuf2 inbuf3;
   stack u8[REJ_BUFLEN] buf0 buf1 buf2 buf3;
   stack u16[KYBER_K*KYBER_VECN] rr;
   reg u256 f;
-  reg u8 flg0 flg1 flg2;
-  reg bool cf zf;
+  reg u64 e0 e1 e2 e3 entry;
 
   inline int i, j;
 
-  f = seed[u256 0];
-  inbuf0[u256 0] = f;
-  inbuf1[u256 0] = f;
-  inbuf2[u256 0] = f;
-  inbuf3[u256 0] = f;
-/*
-  if(transposed == 0)
-  {
-    inbuf0.[u16 KYBER_SYMBYTES] = 0x0000;
-    inbuf1.[u16 KYBER_SYMBYTES] = 0x0001;
-    inbuf2.[u16 KYBER_SYMBYTES] = 0x0002;
-    inbuf3.[u16 KYBER_SYMBYTES] = 0x0100;
+/** 
+  // USING keccak_4x...
+
+  if(transposed == 1) {
+    e0 = 0x0000;
+    e1 = 0x0100;
+    e2 = 0x0200;
+    e3 = 0x0001;
+  } else {
+    e0 = 0x0000;
+    e1 = 0x0001;
+    e2 = 0x0002;
+    e3 = 0x0100;
   }
-  else
-  {
-    inbuf0.[u16 KYBER_SYMBYTES] = 0x0000;
-    inbuf1.[u16 KYBER_SYMBYTES] = 0x0100;
-    inbuf2.[u16 KYBER_SYMBYTES] = 0x0200;
-    inbuf3.[u16 KYBER_SYMBYTES] = 0x0001;
+
+  rr[0:4*KYBER_N] = __gen_entry4x(rr[0:4*KYBER_N], seed, e0, e1, e2, e3);
+
+  if(transposed == 1) {
+    e0 = 0x0101;
+    e1 = 0x0201;
+    e2 = 0x0002;
+    e3 = 0x0102;
+  } else {
+    e0 = 0x0101;
+    e1 = 0x0102;
+    e2 = 0x0200;
+    e3 = 0x0201;
   }
+
+  rr[4*KYBER_N:4*KYBER_N] = __gen_entry4x(rr[4*KYBER_N:4*KYBER_N], seed, e0, e1, e2, e3);
+
+  e0 = 0x0202;
+
+  rr[8*KYBER_N:KYBER_N]
+  = _gen_entry1x(rr[8*KYBER_N:KYBER_N], seed, e0);
+
 */
-  if(transposed == 1)
-  {
-    inbuf0[KYBER_SYMBYTES]   = 0;
-    inbuf0[KYBER_SYMBYTES+1] = 0;
-    inbuf1[KYBER_SYMBYTES]   = 0;
-    inbuf1[KYBER_SYMBYTES+1] = 1;
-    inbuf2[KYBER_SYMBYTES]   = 0;
-    inbuf2[KYBER_SYMBYTES+1] = 2;
-    inbuf3[KYBER_SYMBYTES]   = 1;
-    inbuf3[KYBER_SYMBYTES+1] = 0;
-  }
-  else
-  {
-    inbuf0[KYBER_SYMBYTES]   = 0;
-    inbuf0[KYBER_SYMBYTES+1] = 0;
-    inbuf1[KYBER_SYMBYTES]   = 1;
-    inbuf1[KYBER_SYMBYTES+1] = 0;
-    inbuf2[KYBER_SYMBYTES]   = 2;
-    inbuf2[KYBER_SYMBYTES+1] = 0;
-    inbuf3[KYBER_SYMBYTES]   = 0;
-    inbuf3[KYBER_SYMBYTES+1] = 1;
-  }
 
-
-  rr[0*KYBER_N:4*KYBER_N] //, buf0, buf1, buf2, buf3 
-  = __gen_entry4x(rr[0*KYBER_N:4*KYBER_N], inbuf0, inbuf1, inbuf2, inbuf3); //, buf0, buf1, buf2, buf3);
-/*
-  if(transposed == 0)
-  {
-    inbuf0.[u16 KYBER_SYMBYTES] = 0x0101;
-    inbuf1.[u16 KYBER_SYMBYTES] = 0x0102;
-    inbuf2.[u16 KYBER_SYMBYTES] = 0x0200;
-    inbuf3.[u16 KYBER_SYMBYTES] = 0x0201;
-  }
-  else
-  {
-    inbuf0.[u16 KYBER_SYMBYTES] = 0x0101;
-    inbuf1.[u16 KYBER_SYMBYTES] = 0x0201;
-    inbuf1.[u16 KYBER_SYMBYTES] = 0x0002;
-    inbuf2.[u16 KYBER_SYMBYTES] = 0x0102;
-  }
+/** 
+  // USING keccak_avx2...
 */
-  if(transposed == 1)
-  {
-    inbuf0[KYBER_SYMBYTES]   = 0;
-    inbuf0[KYBER_SYMBYTES+1] = 0;
-    inbuf1[KYBER_SYMBYTES]   = 0;
-    inbuf1[KYBER_SYMBYTES+1] = 1;
-    inbuf2[KYBER_SYMBYTES]   = 0;
-    inbuf2[KYBER_SYMBYTES+1] = 2;
-    inbuf3[KYBER_SYMBYTES]   = 1;
-    inbuf3[KYBER_SYMBYTES+1] = 0;
-  }
-  else
-  {
-    inbuf0[KYBER_SYMBYTES]   = 0;
-    inbuf0[KYBER_SYMBYTES+1] = 0;
-    inbuf1[KYBER_SYMBYTES]   = 1;
-    inbuf1[KYBER_SYMBYTES+1] = 0;
-    inbuf2[KYBER_SYMBYTES]   = 2;
-    inbuf2[KYBER_SYMBYTES+1] = 0;
-    inbuf3[KYBER_SYMBYTES]   = 0;
-    inbuf3[KYBER_SYMBYTES+1] = 1;
-  }
-
-
-  rr[4*KYBER_N:4*KYBER_N] //, buf0, buf1, buf2, buf3 
-  = __gen_entry4x(rr[4*KYBER_N:4*KYBER_N], inbuf0, inbuf1, inbuf2, inbuf3); //, buf0, buf1, buf2, buf3);
-
-/*
-  inbuf0.[u16 KYBER_SYMBYTES] = 0x0202;
-*/
-  inbuf0[KYBER_SYMBYTES]   = 2;
-  inbuf0[KYBER_SYMBYTES+1] = 2;
-
-
-  rr[8*KYBER_N:KYBER_N]//, buf0
-  = __gen_entry1x(rr[8*KYBER_N:KYBER_N], inbuf0); //, buf0);
 
   for i = 0 to KYBER_K {
     for j = 0 to KYBER_K {
-      rr[i*KYBER_VECN+j*KYBER_N : KYBER_N] = _nttunpack(rr[i*KYBER_VECN+j*KYBER_N : KYBER_N]);
+      if(transposed == 1) {
+	entry = 256*j + i;
+      } else {
+	entry = 256*i + j;
+      }
+      rr[i*KYBER_VECN+j*KYBER_N:KYBER_N] = _gen_entry1x(rr[i*KYBER_VECN+j*KYBER_N:KYBER_N], seed, entry);
     }
   }
 
-  return rr;
-}
-
-inline
-fn __gen_block(stack u8[KYBER_SYMBYTES] seed) -> stack u8[168] {
-  inline int i;
-  stack u8[34] extseed;
-  stack u8[168] buf;
-  reg u256[7] state;
-  reg u8 c;
-
-  for i = 0 to KYBER_SYMBYTES
-  {
-    c = seed[i];
-    extseed[i] = c;
-  }
-  extseed[32]=0;
-  extseed[33]=0;
-
-  state = __shake128_absorb34_avx2(extseed);
-  _, buf = __shake128_squeezeblock_avx2(state, buf);
-
-  return buf;
-}
-
-
-
-
-
-inline fn __r2s(reg u256 f) -> stack u256 {
-  stack u256 fs;
-  fs = f;
-  return f;
-}
-
-
-inline fn __s2r(stack u256 fs) -> reg u256 {
-  reg u256 f;
-  f = fs;
-  return f;
-}
-
-inline
-fn __shake128_squeezenblocks(stack u64[25] state, stack u8[REJ_BUFLEN] out)
-      -> stack u64[25], stack u8[REJ_BUFLEN]
-{
-  inline int i;
-
-  for i = 0 to GENMATRIX_NBLOCKS 
-  {
-      state, out[i*SHAKE128_RATE:SHAKE128_RATE] = _shake128_squeezeblock(state, out[i*SHAKE128_RATE:SHAKE128_RATE]);
-  }
-  out[u64 63] = 0;
-  return state, out;
-}
-
-
-inline
-fn __gen_matrix(stack u8[KYBER_SYMBYTES] seed, inline int transposed) -> stack u16[KYBER_K*KYBER_VECN]
-{
-  stack u8[REJ_BUFLEN] buf0 buf1 buf2 buf3;
-  stack u256[25] state;
-  stack u256[7] st0 st1 st2 st3;
-  reg u256[7] st;
-  stack u256[7] st_s;
-  stack u16[KYBER_K*KYBER_VECN] rr;
-  stack u256 fs;
-  reg u256 f;
-  reg u64 ctr0 ctr1 ctr2 ctr3 tmp;
-  stack u64 ctr0_s trans_s;
-  reg u8 flg0 flg1 bflg;
-  reg bool cf zf;
-
-  inline int i, j;
-
-  f = seed[u256 0];
-  buf0[u256 0] = f;
-  buf1[u256 0] = f;
-  buf2[u256 0] = f;
-  buf3[u256 0] = f;
-  fs = __r2s(f);
-
-  if(transposed == 1)
-  {
-    buf0[KYBER_SYMBYTES]   = 0;
-    buf0[KYBER_SYMBYTES+1] = 0;
-    buf1[KYBER_SYMBYTES]   = 0;
-    buf1[KYBER_SYMBYTES+1] = 1;
-    buf2[KYBER_SYMBYTES]   = 0;
-    buf2[KYBER_SYMBYTES+1] = 2;
-    buf3[KYBER_SYMBYTES]   = 1;
-    buf3[KYBER_SYMBYTES+1] = 0;
-  }
-  else
-  {
-    buf0[KYBER_SYMBYTES]   = 0;
-    buf0[KYBER_SYMBYTES+1] = 0;
-    buf1[KYBER_SYMBYTES]   = 1;
-    buf1[KYBER_SYMBYTES+1] = 0;
-    buf2[KYBER_SYMBYTES]   = 2;
-    buf2[KYBER_SYMBYTES+1] = 0;
-    buf3[KYBER_SYMBYTES]   = 0;
-    buf3[KYBER_SYMBYTES+1] = 1;
-  }
-
-
-  rr[0:4*KYBER_N] = __gen_entry4x(rr[0:4*KYBER_N], buf0[0:34], buf1[0:34], buf2[0:34], buf3[0:34]);
-
-
-  f = __s2r(fs);
-  buf0[u256 0] = f;
-  buf1[u256 0] = f;
-  buf2[u256 0] = f;
-  buf3[u256 0] = f;
-  fs = __r2s(f);
-
-  if(transposed == 1)
-  {
-    buf0[KYBER_SYMBYTES]   = 1;
-    buf0[KYBER_SYMBYTES+1] = 1;
-    buf1[KYBER_SYMBYTES]   = 1;
-    buf1[KYBER_SYMBYTES+1] = 2;
-    buf2[KYBER_SYMBYTES]   = 2;
-    buf2[KYBER_SYMBYTES+1] = 0;
-    buf3[KYBER_SYMBYTES]   = 2;
-    buf3[KYBER_SYMBYTES+1] = 1;
-  }
-  else
-  {
-    buf0[KYBER_SYMBYTES]   = 1;
-    buf0[KYBER_SYMBYTES+1] = 1;
-    buf1[KYBER_SYMBYTES]   = 2;
-    buf1[KYBER_SYMBYTES+1] = 1;
-    buf2[KYBER_SYMBYTES]   = 0;
-    buf2[KYBER_SYMBYTES+1] = 2;
-    buf3[KYBER_SYMBYTES]   = 1;
-    buf3[KYBER_SYMBYTES+1] = 2;
-  }
-
-  rr[4*KYBER_N:4*KYBER_N] = __gen_entry4x(rr[4*KYBER_N:4*KYBER_N], buf0[0:34], buf1[0:34], buf2[0:34], buf3[0:34]);
-  f = __s2r(fs);
-
-  buf0[u256 0] = f;
-  buf0[KYBER_SYMBYTES]   = 2;
-  buf0[KYBER_SYMBYTES+1] = 2;
-
-  rr[2*KYBER_VECN+2*KYBER_N:KYBER_N]//, buf0
-  = __gen_entry1x(rr[2*KYBER_VECN+2*KYBER_N:KYBER_N], buf0[0:34]); //, buf0);
-
-
-  for i = 0 to KYBER_K
-  {
-    for j = 0 to KYBER_K
-    {
+  for i = 0 to KYBER_K {
+    for j = 0 to KYBER_K {
       rr[i*KYBER_VECN+j*KYBER_N:KYBER_N] = _nttunpack(rr[i*KYBER_VECN+j*KYBER_N:KYBER_N]);
     }
   }
 
   return rr;
 }
-
-
-
-
-
-
-
-/*
-
-inline
-fn __gen_matrix(stack u8[KYBER_SYMBYTES] seed, inline int transposed) -> stack u16[KYBER_K*KYBER_VECN]
-{
-  stack u8[REJ_BUFLEN] buf0;
-  stack u8[REJ_BUFLEN] buf1;
-  stack u8[REJ_BUFLEN] buf2;
-  stack u8[REJ_BUFLEN] buf3;
-  stack u16[KYBER_K*KYBER_VECN] rr;
-  stack u256[25] state;
-  
-  stack u256 fs;
-  reg u256 f;
-  reg u64 ctr0 ctr1 ctr2 ctr3 tmp;
-  stack u64 ctr0_s;
-  reg u8 flg0 flg1 bflg;
-  reg bool cf zf;
-
-  inline int i, j;
-
-  f = seed[u256 0];
-  buf0[u256 0] = f;
-  buf1[u256 0] = f;
-  buf2[u256 0] = f;
-  buf3[u256 0] = f;
-  fs = __r2s(f);
-
-  if(transposed == 1)
-  {
-    buf0[KYBER_SYMBYTES]   = 0;
-    buf0[KYBER_SYMBYTES+1] = 0;
-    buf1[KYBER_SYMBYTES]   = 0;
-    buf1[KYBER_SYMBYTES+1] = 1;
-    buf2[KYBER_SYMBYTES]   = 0;
-    buf2[KYBER_SYMBYTES+1] = 2;
-    buf3[KYBER_SYMBYTES]   = 1;
-    buf3[KYBER_SYMBYTES+1] = 0;
-  }
-  else
-  {
-    buf0[KYBER_SYMBYTES]   = 0;
-    buf0[KYBER_SYMBYTES+1] = 0;
-    buf1[KYBER_SYMBYTES]   = 1;
-    buf1[KYBER_SYMBYTES+1] = 0;
-    buf2[KYBER_SYMBYTES]   = 2;
-    buf2[KYBER_SYMBYTES+1] = 0;
-    buf3[KYBER_SYMBYTES]   = 0;
-    buf3[KYBER_SYMBYTES+1] = 1;
-  }
-
-  state = __shake128_absorb4x_34(state, buf0[0:34], buf1[0:34], buf2[0:34], buf3[0:34]);
-  state, buf0, buf1, buf2, buf3 = __shake128_squeeze3blocks4x(state, buf0, buf1, buf2, buf3);
-
-  tmp, rr[0*KYBER_VECN+0*KYBER_N:KYBER_N] = _rej_uniform_avx(rr[0*KYBER_VECN+0*KYBER_N:KYBER_N], buf0);
-  ctr0 = tmp;
-  tmp, rr[0*KYBER_VECN+1*KYBER_N:KYBER_N] = _rej_uniform_avx(rr[0*KYBER_VECN+1*KYBER_N:KYBER_N], buf1);
-  ctr1 = tmp;
-  tmp, rr[0*KYBER_VECN+2*KYBER_N:KYBER_N] = _rej_uniform_avx(rr[0*KYBER_VECN+2*KYBER_N:KYBER_N], buf2);
-  ctr2 = tmp;
-  ctr3, rr[1*KYBER_VECN+0*KYBER_N:KYBER_N] = _rej_uniform_avx(rr[1*KYBER_VECN+0*KYBER_N:KYBER_N], buf3);
-
-  _, cf, _, _, zf = #CMP_64(ctr0, KYBER_N - 1);
-  flg0 = #SETcc(cf || zf); //SETBE
-
-  _, cf, _, _, zf = #CMP_64(ctr1, KYBER_N - 1);
-  flg1 = #SETcc(cf || zf);
-
-  _, _, _, _, _, bflg = #OR_8(flg0, flg1);
-
-  _, cf, _, _, zf = #CMP_64(ctr2, KYBER_N - 1);
-  flg0 = #SETcc(cf || zf);
-
-  _, cf, _, _, zf = #CMP_64(ctr3, KYBER_N - 1);
-  flg1 = #SETcc(cf || zf);
-
-  _, _, _, _, _, flg0 = #OR_8(flg0, flg1);
-  _, _, _, _, _, bflg = #OR_8(flg0, bflg);
-
-  while(bflg != 0) {
-    state, buf0[0:SHAKE128_RATE], buf1[0:SHAKE128_RATE], buf2[0:SHAKE128_RATE], buf3[0:SHAKE128_RATE] = __shake128_squeezeblock4x(state, buf0[0:SHAKE128_RATE], buf1[0:SHAKE128_RATE], buf2[0:SHAKE128_RATE], buf3[0:SHAKE128_RATE]);
-
-    ctr0, rr[0*KYBER_VECN+0*KYBER_N:KYBER_N] = __rej_uniform(rr[0*KYBER_VECN+0*KYBER_N:KYBER_N], ctr0, buf0[0:SHAKE128_RATE], SHAKE128_RATE);
-    ctr1, rr[0*KYBER_VECN+1*KYBER_N:KYBER_N] = __rej_uniform(rr[0*KYBER_VECN+1*KYBER_N:KYBER_N], ctr1, buf1[0:SHAKE128_RATE], SHAKE128_RATE);
-    ctr2, rr[0*KYBER_VECN+2*KYBER_N:KYBER_N] = __rej_uniform(rr[0*KYBER_VECN+2*KYBER_N:KYBER_N], ctr2, buf2[0:SHAKE128_RATE], SHAKE128_RATE);
-    ctr3, rr[1*KYBER_VECN+0*KYBER_N:KYBER_N] = __rej_uniform(rr[1*KYBER_VECN+0*KYBER_N:KYBER_N], ctr3, buf3[0:SHAKE128_RATE], SHAKE128_RATE);
-
-    _, cf, _, _, zf = #CMP_64(ctr0, KYBER_N - 1);
-    flg0 = #SETcc(cf || zf);
-
-    _, cf, _, _, zf = #CMP_64(ctr1, KYBER_N - 1);
-    flg1 = #SETcc(cf || zf);
-
-    _, _, _, _, _, bflg = #OR_8(flg0, flg1);
-
-    _, cf, _, _, zf = #CMP_64(ctr2, KYBER_N - 1);
-    flg0 = #SETcc(cf || zf);
-
-    _, cf, _, _, zf = #CMP_64(ctr3, KYBER_N - 1);
-    flg1 = #SETcc(cf || zf);
-
-    _, _, _, _, _, flg0 = #OR_8(flg0, flg1);
-    _, _, _, _, _, bflg = #OR_8(flg0, bflg);
-  }
-  
-  f = __s2r(fs);
-  buf0[u256 0] = f;
-  buf1[u256 0] = f;
-  buf2[u256 0] = f;
-  buf3[u256 0] = f;
-  fs = __r2s(f);
-
-  if(transposed == 1)
-  {
-    buf0[KYBER_SYMBYTES]   = 1;
-    buf0[KYBER_SYMBYTES+1] = 1;
-    buf1[KYBER_SYMBYTES]   = 1;
-    buf1[KYBER_SYMBYTES+1] = 2;
-    buf2[KYBER_SYMBYTES]   = 2;
-    buf2[KYBER_SYMBYTES+1] = 0;
-    buf3[KYBER_SYMBYTES]   = 2;
-    buf3[KYBER_SYMBYTES+1] = 1;
-  }
-  else
-  {
-    buf0[KYBER_SYMBYTES]   = 1;
-    buf0[KYBER_SYMBYTES+1] = 1;
-    buf1[KYBER_SYMBYTES]   = 2;
-    buf1[KYBER_SYMBYTES+1] = 1;
-    buf2[KYBER_SYMBYTES]   = 0;
-    buf2[KYBER_SYMBYTES+1] = 2;
-    buf3[KYBER_SYMBYTES]   = 1;
-    buf3[KYBER_SYMBYTES+1] = 2;
-  }
-
-  state = __shake128_absorb4x_34(state, buf0[0:34], buf1[0:34], buf2[0:34], buf3[0:34]);
-  state, buf0, buf1, buf2, buf3 = __shake128_squeeze3blocks4x(state, buf0, buf1, buf2, buf3);
-
-  tmp, rr[1*KYBER_VECN+1*KYBER_N:KYBER_N] = _rej_uniform_avx(rr[1*KYBER_VECN+1*KYBER_N:KYBER_N], buf0);
-  ctr0 = tmp;
-  tmp, rr[1*KYBER_VECN+2*KYBER_N:KYBER_N] = _rej_uniform_avx(rr[1*KYBER_VECN+2*KYBER_N:KYBER_N], buf1);
-  ctr1 = tmp;
-  tmp, rr[2*KYBER_VECN+0*KYBER_N:KYBER_N] = _rej_uniform_avx(rr[2*KYBER_VECN+0*KYBER_N:KYBER_N], buf2);
-  ctr2 = tmp;
-  ctr3, rr[2*KYBER_VECN+1*KYBER_N:KYBER_N] = _rej_uniform_avx(rr[2*KYBER_VECN+1*KYBER_N:KYBER_N], buf3);
-
-  _, cf, _, _, zf = #CMP_64(ctr0, KYBER_N - 1);
-  flg0 = #SETcc(cf || zf);
-
-  _, cf, _, _, zf = #CMP_64(ctr1, KYBER_N - 1);
-  flg1 = #SETcc(cf || zf);
-
-  _, _, _, _, _, bflg = #OR_8(flg0, flg1);
-
-  _, cf, _, _, zf = #CMP_64(ctr2, KYBER_N - 1);
-  flg0 = #SETcc(cf || zf);
-
-  _, cf, _, _, zf = #CMP_64(ctr3, KYBER_N - 1);
-  flg1 = #SETcc(cf || zf);
-
-  _, _, _, _, _, flg0 = #OR_8(flg0, flg1);
-  _, _, _, _, _, bflg = #OR_8(flg0, bflg);
-
-
-  while(bflg != 0) {
-    state, buf0[0:SHAKE128_RATE], buf1[0:SHAKE128_RATE], buf2[0:SHAKE128_RATE], buf3[0:SHAKE128_RATE] = __shake128_squeezeblock4x(state, buf0[0:SHAKE128_RATE], buf1[0:SHAKE128_RATE], buf2[0:SHAKE128_RATE], buf3[0:SHAKE128_RATE]);
-
-    ctr0, rr[1*KYBER_VECN+1*KYBER_N:KYBER_N] = __rej_uniform(rr[1*KYBER_VECN+1*KYBER_N:KYBER_N], ctr0, buf0[0:SHAKE128_RATE], SHAKE128_RATE);
-    ctr1, rr[1*KYBER_VECN+2*KYBER_N:KYBER_N] = __rej_uniform(rr[1*KYBER_VECN+2*KYBER_N:KYBER_N], ctr1, buf1[0:SHAKE128_RATE], SHAKE128_RATE);
-    ctr2, rr[2*KYBER_VECN+0*KYBER_N:KYBER_N] = __rej_uniform(rr[2*KYBER_VECN+0*KYBER_N:KYBER_N], ctr2, buf2[0:SHAKE128_RATE], SHAKE128_RATE);
-    ctr3, rr[2*KYBER_VECN+1*KYBER_N:KYBER_N] = __rej_uniform(rr[2*KYBER_VECN+1*KYBER_N:KYBER_N], ctr3, buf3[0:SHAKE128_RATE], SHAKE128_RATE);
-
-    _, cf, _, _, zf = #CMP_64(ctr0, KYBER_N - 1);
-    flg0 = #SETcc(cf || zf);
-
-    _, cf, _, _, zf = #CMP_64(ctr1, KYBER_N - 1);
-    flg1 = #SETcc(cf || zf);
-
-    _, _, _, _, _, bflg = #OR_8(flg0, flg1);
-
-    _, cf, _, _, zf = #CMP_64(ctr2, KYBER_N - 1);
-    flg0 = #SETcc(cf || zf);
-
-    _, cf, _, _, zf = #CMP_64(ctr3, KYBER_N - 1);
-    flg1 = #SETcc(cf || zf);
-
-    _, _, _, _, _, flg0 = #OR_8(flg0, flg1);
-    _, _, _, _, _, bflg = #OR_8(flg0, bflg);
-  }
-
-  f = __s2r(fs);
-  buf0[u256 0] = f;
-  buf0[KYBER_SYMBYTES]   = 2;
-  buf0[KYBER_SYMBYTES+1] = 2;
-
-  state[u64 0:25] = _shake128_absorb34(state[u64 0:25], buf0[0:34]);
-  state[u64 0:25], buf0 = __shake128_squeezenblocks(state[u64 0:25], buf0);
-
-  ctr0, rr[2*KYBER_VECN+2*KYBER_N:KYBER_N] = _rej_uniform_avx(rr[2*KYBER_VECN+2*KYBER_N:KYBER_N], buf0);
-
-  _, cf, _, _, zf = #CMP_64(ctr0, KYBER_N - 1);
-  bflg = #SETcc(cf || zf);
-
-  while(bflg != 0) {
-    ctr0_s = ctr0;
-    state[u64 0:25], buf0[0:SHAKE128_RATE] = _shake128_squeezeblock(state[u64 0:25], buf0[0:SHAKE128_RATE]);
-    ctr0 = ctr0_s;
-
-    ctr0, rr[2*KYBER_VECN+2*KYBER_N:KYBER_N] = __rej_uniform(rr[2*KYBER_VECN+2*KYBER_N:KYBER_N], ctr0, buf0[0:SHAKE128_RATE], SHAKE128_RATE);
-
-    _, cf, _, _, zf = #CMP_64(ctr0, KYBER_N - 1);
-    bflg = #SETcc(cf || zf);
-  }
-
-  for i = 0 to KYBER_K
-  {
-    for j = 0 to KYBER_K
-    {
-      rr[i*KYBER_VECN+j*KYBER_N:KYBER_N] = _nttunpack(rr[i*KYBER_VECN+j*KYBER_N:KYBER_N]);
-    }
-  }
-
-  return rr;
-}
-
-
-
-*/
