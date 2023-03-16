@@ -374,10 +374,12 @@ fn __u64x4_u256(reg u64 x0 x1 x2 x3) -> reg u256 {
  */
 
 inline
-fn __read_below_rate(reg u64 in, inline int i rate) -> reg u64 {
+fn __read_below_rate(reg u64 in, inline int j rate) -> reg u64 {
+  inline int i;
   reg u64 t;
-  if (i < rate) {
-    t = [in + i];
+  i = __INV_P(j);
+  if (8*i < rate) { // static check
+    t = [in + 8*i];
   } else {
     t = #set0();
   }
@@ -391,25 +393,17 @@ fn __add_full_block_avx2(
   inline int rate //in bytes
 ) -> reg u256[7], reg u64, reg u64
 {
-  inline int j i;
+  inline int j;
   reg u256 t256;
   reg u64 l t0 t1 t2 t3;
 
   t256 = #VPBROADCAST_4u64([in + 0]);
   state[0] ^= t256;
   for j = 0 to 6 {
-    i = __INV_P(4*j+0);
-    i *= 8;
-    t0 = __read_below_rate(in, i, rate);
-    i = __INV_P(4*j+1);
-    i *= 8;
-    t1 = __read_below_rate(in, i, rate);
-    i = __INV_P(4*j+2);
-    i *= 8;
-    t2 = __read_below_rate(in, i, rate);
-    i = __INV_P(4*j+3);
-    i *= 8;
-    t3 = __read_below_rate(in, i, rate);
+    t0 = __read_below_rate(in, 4*j+0, rate);
+    t1 = __read_below_rate(in, 4*j+1, rate);
+    t2 = __read_below_rate(in, 4*j+2, rate);
+    t3 = __read_below_rate(in, 4*j+3, rate);
     t256 = __u64x4_u256(t0, t1, t2, t3);
     state[j+1] ^= t256;
   }
@@ -419,28 +413,34 @@ fn __add_full_block_avx2(
   return state, in, inlen;
 }
 
-/*
 inline
 fn __read_below_inlen( reg u64 in
 		     , reg u64 inlen //@pre: inlen < rate
-		     , reg u64 trail_byte
-		     , inline int i
+		     , reg u64 trail
+		     , inline int j
 		     , inline int rate
 		     ) -> reg u64
 {
-  reg u64 x;
+  inline int i ppos;
+  reg u64 x y;
+  reg u8 sh;
+
+  i = __INV_P(j);
+
   x = 0;
+
+  i *= 8; // ERROR???? (check this!!!)
+
   if (i < rate) { // static test
     if (inlen >= i) {
       if (inlen >= i+8) {
         x = [in + i];
       } else {
-        x = 0;
 	sh = 0;
         if (inlen >= i+4) {
 	  x = (64u) (u32) [in + i];
 	  i += 4;
-	  trail_byte <<= 32;
+	  trail <<= 32;
 	  sh = 32;
 	}
         if (inlen >= i+2) {
@@ -448,7 +448,7 @@ fn __read_below_inlen( reg u64 in
 	  y <<= sh;
 	  x |= y;
 	  i += 2;
-	  trail_byte <<= 16;
+	  trail <<= 16;
 	  sh += 16;
 	}
         if (inlen >= i+1) {
@@ -456,73 +456,48 @@ fn __read_below_inlen( reg u64 in
 	  y <<= sh;
 	  x |= y;
 	  i += 1;
-	  trail_byte <<= 8;
+	  trail <<= 8;
 	  sh += 8;
 	}
-	x |= trail_byte;
+	x |= trail;
+       	}
+      }
+      ppos = __INV_P(rate/8-1);
+      if (i == 8*ppos) {
+        y = 0x8000000000000000;
+        x |= y;
       }
     }
-  return 0;
+  return x;
 }
     
 
 inline
-fn __add_final_blockX_avx2(
+fn __add_final_block_avx2_NEW(
   reg  u256[7] state,
   reg   u64 in inlen,
   reg   u8  trail_byte,
   inline int rate
 ) -> reg u256[7]
 {
-  inline int j i;
+  inline int j;
   reg u256 t256;
-  reg u64 l t0 t1 t2 t3 trail;
-  trail = (64u) trail_byte;
+  reg u64 t0 t1 t2 t3;
 
   t256 = #VPBROADCAST_4u64([in + 0]);
   state[0] ^= t256;
   for j = 0 to 6 {
-    i = __INV_P(4*j+0);
-    i *= 8;
-    inlen, t0 = __read_below_inlen(in, inlen, trail, i);
-    i = __INV_P(4*j+1);
-    i *= 8;
-    inlen, t1 = __read_below_inlen(in, inlen, trail, i);
-    i = __INV_P(4*j+2);
-    i *= 8;
-    inlen, t2 = __read_below_inlen(in, i, inlen, trail, i);
-    i = __INV_P(4*j+3);
-    i *= 8;
-    inlen, t3 = __read_below_inlen(in, i, inlen, trail, i);
+    t0 = __read_below_inlen(in, inlen, (64u) trail_byte, 4*j+0, rate);
+    t1 = __read_below_inlen(in, inlen, (64u) trail_byte, 4*j+1, rate);
+    t2 = __read_below_inlen(in, inlen, (64u) trail_byte, 4*j+2, rate);
+    t3 = __read_below_inlen(in, inlen, (64u) trail_byte, 4*j+3, rate);
     t256 = __u64x4_u256(t0, t1, t2, t3);
     state[j+1] ^= t256;
   }
 
-  in += rate;
-  inlen -= rate;
-  return state, in, inlen;
-
-  s_state[u8 (int) l] = trail_byte;
-
-  // i  = (rate-1) >> 3;
-  i = rate; i -= 1; i = i/8;
-  l  = a_jagged_p[i];
-  l <<= 3;
-  // l += ((rate-1) & 0x7)
-  i = rate; i -= 1; i &= 0x7;
-  l += i;
-
-  s_state[u8 (int) l] ^= 0x80;
-
-  t256 = #VPBROADCAST_4u64(s_state[0]);
-  state[0] ^= t256;
-
-  for i = 1 to 7
-  { state[i] ^= s_state[u256 i]; }
-
   return state;
 }
-*/
+
 
 inline fn __add_final_block_avx2(
   reg  u256[7] state,
